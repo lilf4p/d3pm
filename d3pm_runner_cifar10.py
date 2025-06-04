@@ -13,12 +13,22 @@ from dit import DiT_Llama
 
 if __name__ == "__main__":
 
+    # choose the device
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
+    print(f"Using device: {device}")
+
     wandb.init(project="d3pm_cifar10")
 
     N = 8  # number of classes for discretized state per pixel
     d3pm = D3PM(
         DiT_Llama(3, N, dim=1024), 1000, num_classes=N, hybrid_loss_coeff=0.0
-    ).cuda()
+    ).to(device)
     print(f"Total Param Count: {sum([p.numel() for p in d3pm.x0_model.parameters()])}")
     dataset = CIFAR10(
         "./data",
@@ -31,12 +41,11 @@ if __name__ == "__main__":
             ]
         ),
     )
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=16)
+    dataloader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=8)
     optim = torch.optim.AdamW(d3pm.x0_model.parameters(), lr=2e-5)
     d3pm.train()
 
     n_epoch = 4000
-    device = "cuda"
 
     global_step = 0
     for i in range(n_epoch):
@@ -81,8 +90,8 @@ if __name__ == "__main__":
                 d3pm.eval()
 
                 with torch.no_grad():
-                    cond = torch.arange(0, 16).cuda() % 10
-                    init_noise = torch.randint(0, N, (16, 3, 32, 32)).cuda()
+                    cond = torch.arange(0, 16).to(device) % 10
+                    init_noise = torch.randint(0, N, (16, 3, 32, 32)).to(device)
 
                     images = d3pm.sample_with_image_sequence(
                         init_noise, cond, stride=40

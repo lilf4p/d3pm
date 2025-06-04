@@ -341,8 +341,19 @@ class D3PM(nn.Module):
 
 if __name__ == "__main__":
 
+    # add support for MPS device (macOS)
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+    print(f"Using device: {device}")
+
+    #device = "cpu"
+
     N = 2  # number of classes for discretized state per pixel
-    d3pm = D3PM(DummyX0Model(1, N), 1000, num_classes=N, hybrid_loss_coeff=0.0).cuda()
+    d3pm = D3PM(DummyX0Model(1, N), 1000, num_classes=N, hybrid_loss_coeff=0.0).to(device)
     print(f"Total Param Count: {sum([p.numel() for p in d3pm.x0_model.parameters()])}")
     dataset = MNIST(
         "./data",
@@ -355,13 +366,12 @@ if __name__ == "__main__":
             ]
         ),
     )
-    dataloader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=32)
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=2)
 
     optim = torch.optim.AdamW(d3pm.x0_model.parameters(), lr=1e-3)
     d3pm.train()
 
     n_epoch = 400
-    device = "cuda"
 
     global_step = 0
     for i in range(n_epoch):
@@ -397,8 +407,8 @@ if __name__ == "__main__":
                 d3pm.eval()
 
                 with torch.no_grad():
-                    cond = torch.arange(0, 4).cuda() % 10
-                    init_noise = torch.randint(0, N, (4, 1, 32, 32)).cuda()
+                    cond = torch.arange(0, 4).to(device) % 10
+                    init_noise = torch.randint(0, N, (4, 1, 32, 32)).to(device)
 
                     images = d3pm.sample_with_image_sequence(
                         init_noise, cond, stride=40
