@@ -1,12 +1,18 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
 from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import MNIST
 from torchvision.utils import make_grid
 from tqdm import tqdm
+import os
+import wandb
+from argparse import ArgumentParser
 
 blk = lambda ic, oc: nn.Sequential(
     nn.Conv2d(ic, oc, 5, padding=2),
@@ -339,97 +345,231 @@ class D3PM(nn.Module):
         return images
 
 
-if __name__ == "__main__":
+class D3PMLightning(pl.LightningModule):
+    def __init__(
+        self,
+        n_channel: int = 1,
+        N: int = 2,
+        n_T: int = 1000,
+        num_classes: int = 2,
+        forward_type: str = "uniform",
+        hybrid_loss_coeff: float = 0.0,
+        lr: float = 1e-3,
+    ) -> None:
+        super(D3PMLightning, self).__init__()
+        self.save_hyperparameters()
+        self.x0_model = DummyX0Model(n_channel, N)
+        self.d3pm = D3PM(
+            self.x0_model, n_T, num_classes, forward_type, hybrid_loss_coeff
+        )
+        self.N = N
+        self.lr = lr
 
-    # add support for MPS device (macOS)
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
-    else:
-        device = "cpu"
-    print(f"Using device: {device}")
+    def forward(self, x, cond=None):
+        return self.d3pm.model_predict(x, cond)
 
-    #device = "cpu"
+    def training_step(self, batch, batch_idx):
+        x, cond = batch
+        # discretize x to N bins
+        x = (x * (self.N - 1)).round().long().clamp(0, self.N - 1)
+        loss, info = self.d3pm(x, cond)
 
-    N = 2  # number of classes for discretized state per pixel
-    d3pm = D3PM(DummyX0Model(1, N), 1000, num_classes=N, hybrid_loss_coeff=0.0).to(device)
-    print(f"Total Param Count: {sum([p.numel() for p in d3pm.x0_model.parameters()])}")
-    dataset = MNIST(
-        "./data",
-        train=True,
-        download=True,
-        transform=transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Pad(2),
-            ]
-        ),
-    )
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=2)
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('vb_loss', info['vb_loss'], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('ce_loss', info['ce_loss'], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
 
-    optim = torch.optim.AdamW(d3pm.x0_model.parameters(), lr=1e-3)
-    d3pm.train()
+        return loss
 
-    n_epoch = 400
+    def validation_step(self, batch, batch_idx):
+        x, cond = batch
+        # discretize x to N bins
+        x = (x * (self.N - 1)).round().long().clamp(0, self.N - 1)
+        loss, info = self.d3pm(x, cond)
 
-    global_step = 0
-    for i in range(n_epoch):
+        self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
+        return loss
 
-        pbar = tqdm(dataloader)
-        loss_ema = None
-        for x, cond in pbar:
-            optim.zero_grad()
-            x = x.to(device)
-            cond = cond.to(device)
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.x0_model.parameters(), lr=self.lr)
+        return optimizer
 
-            # discritize x to N bins
-            x = (x * (N - 1)).round().long().clamp(0, N - 1)
-            loss, info = d3pm(x, cond)
+    def on_validation_epoch_end(self):
+        if self.global_step == 0:
+            return
 
-            loss.backward()
-            norm = torch.nn.utils.clip_grad_norm_(d3pm.x0_model.parameters(), 0.1)
+        # Generate samples
+        self.eval()
+        with torch.no_grad():
+            cond = torch.arange(0, 4).to(self.device) % 10
+            init_noise = torch.randint(0, self.N, (4, 1, 32, 32)).to(self.device)
 
-            with torch.no_grad():
-                param_norm = sum([torch.norm(p) for p in d3pm.x0_model.parameters()])
+            images = self.d3pm.sample_with_image_sequence(init_noise, cond, stride=40)
 
-            if loss_ema is None:
-                loss_ema = loss.item()
-            else:
-                loss_ema = 0.99 * loss_ema + 0.01 * loss.item()
-            pbar.set_description(
-                f"loss: {loss_ema:.4f}, norm: {norm:.4f}, param_norm: {param_norm:.4f}, vb_loss: {info['vb_loss']:.4f}, ce_loss: {info['ce_loss']:.4f}"
+            # Save image sequences as GIF
+            gif = []
+            for image in images:
+                x_as_image = make_grid(image.float() / (self.N - 1), nrow=2)
+                img = x_as_image.permute(1, 2, 0).cpu().numpy()
+                img = (img * 255).astype(np.uint8)
+                gif.append(Image.fromarray(img))
+
+            # Create contents directory if it doesn't exist
+            os.makedirs("contents", exist_ok=True)
+
+            gif_path = f"contents/sample_{self.global_step}.gif"
+            png_path = f"contents/sample_{self.global_step}_last.png"
+
+            gif[0].save(
+                gif_path,
+                save_all=True,
+                append_images=gif[1:],
+                duration=100,
+                loop=0,
             )
-            optim.step()
-            global_step += 1
 
-            if global_step % 300 == 1:
-                d3pm.eval()
+            last_img = gif[-1]
+            last_img.save(png_path)
 
-                with torch.no_grad():
-                    cond = torch.arange(0, 4).to(device) % 10
-                    init_noise = torch.randint(0, N, (4, 1, 32, 32)).to(device)
+            # Log images to wandb
+            if isinstance(self.logger, WandbLogger):
+                self.logger.experiment.log({
+                    "generation_gif": wandb.Image(gif_path),
+                    "final_image": wandb.Image(png_path),
+                    "step": self.global_step
+                })
 
-                    images = d3pm.sample_with_image_sequence(
-                        init_noise, cond, stride=40
-                    )
-                    # image sequences to gif
-                    gif = []
-                    for image in images:
-                        x_as_image = make_grid(image.float() / (N - 1), nrow=2)
-                        img = x_as_image.permute(1, 2, 0).cpu().numpy()
-                        img = (img * 255).astype(np.uint8)
-                        gif.append(Image.fromarray(img))
+class MNISTDataModule(pl.LightningDataModule):
+    def __init__(self, data_dir: str = "./data", batch_size: int = 32, num_workers: int = 2):
+        super().__init__()
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
 
-                    gif[0].save(
-                        f"contents/sample_{global_step}.gif",
-                        save_all=True,
-                        append_images=gif[1:],
-                        duration=100,
-                        loop=0,
-                    )
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Pad(2),
+        ])
 
-                    last_img = gif[-1]
-                    last_img.save(f"contents/sample_{global_step}_last.png")
+    def prepare_data(self):
+        # Download data if needed
+        MNIST(self.data_dir, train=True, download=True)
+        MNIST(self.data_dir, train=False, download=True)
 
-                d3pm.train()
+    def setup(self, stage=None):
+        # Assign train/val datasets
+        if stage == 'fit' or stage is None:
+            self.mnist_train = MNIST(self.data_dir, train=True, transform=self.transform)
+            # Use a small subset for validation
+            train_size = int(0.9 * len(self.mnist_train))
+            val_size = len(self.mnist_train) - train_size
+            self.mnist_train, self.mnist_val = torch.utils.data.random_split(
+                self.mnist_train, [train_size, val_size]
+            )
+
+        # Assign test dataset
+        if stage == 'test' or stage is None:
+            self.mnist_test = MNIST(self.data_dir, train=False, transform=self.transform)
+
+    def train_dataloader(self):
+        return DataLoader(self.mnist_train, batch_size=self.batch_size,
+                          shuffle=True, num_workers=self.num_workers)
+
+    def val_dataloader(self):
+        return DataLoader(self.mnist_val, batch_size=self.batch_size,
+                          num_workers=self.num_workers)
+
+    def test_dataloader(self):
+        return DataLoader(self.mnist_test, batch_size=self.batch_size,
+                          num_workers=self.num_workers)
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--max_epochs", type=int, default=400)
+    parser.add_argument("--N", type=int, default=2, help="Number of classes for discretized state")
+    parser.add_argument("--hybrid_loss_coeff", type=float, default=0.0)
+    parser.add_argument("--project", type=str, default="d3pm", help="WandB project name")
+    parser.add_argument("--name", type=str, default=None, help="WandB run name")
+
+    # Add trainer specific arguments
+    parser.add_argument("--accelerator", type=str, default="auto")
+    parser.add_argument("--devices", type=str, default="auto",
+                       help="Number of devices to use (int) or 'auto' for all available devices")
+    parser.add_argument("--num_gpus", type=int, default=None,
+                       help="Number of GPUs to use (overrides --devices)")
+    parser.add_argument("--strategy", type=str, default=None,
+                       help="Training strategy: 'ddp', 'deepspeed', etc.")
+    parser.add_argument("--precision", type=str, default="32-true")
+
+    args = parser.parse_args()
+
+    # Convert devices to the right format if num_gpus is specified
+    devices = args.devices
+    if args.num_gpus is not None:
+        devices = args.num_gpus
+        # Automatically set strategy to ddp when using multiple GPUs
+        if args.num_gpus > 1 and args.strategy is None:
+            args.strategy = "ddp"
+
+    # Initialize wandb run first
+    run_name = args.name if args.name else f"d3pm_N{args.N}_bs{args.batch_size}_lr{args.lr}"
+
+    # Create config dictionary
+    config = {
+        "N": args.N,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "max_epochs": args.max_epochs,
+        "hybrid_loss_coeff": args.hybrid_loss_coeff,
+        "num_workers": args.num_workers,
+        "accelerator": args.accelerator,
+        "devices": devices,
+        "strategy": args.strategy,
+        "precision": args.precision
+    }
+
+    # Then create the wandb logger using the initialized run
+    wandb_logger = WandbLogger(project=args.project, name=run_name, log_model="all", config=config)
+
+    # Initialize model and data module
+    model = D3PMLightning(
+        N=args.N,
+        hybrid_loss_coeff=args.hybrid_loss_coeff,
+        lr=args.lr
+    )
+
+    dm = MNISTDataModule(
+        batch_size=args.batch_size,
+        num_workers=args.num_workers
+    )
+
+    # Setup callbacks
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="checkpoints",
+        filename="{epoch}-{val_loss:.4f}",
+        save_top_k=3,
+        monitor="val_loss",
+        mode="min"
+    )
+
+    # Initialize the trainer with WandB logger
+    trainer = pl.Trainer(
+        max_epochs=args.max_epochs,
+        log_every_n_steps=10,
+        gradient_clip_val=0.1,
+        callbacks=[checkpoint_callback],
+        logger=wandb_logger,
+        precision=args.precision,
+        strategy=args.strategy if args.strategy else None,
+        devices=devices,
+        accelerator=args.accelerator
+    )
+
+    # Train the model
+    trainer.fit(model, dm)
+
+    # Close wandb run
+    wandb.finish()

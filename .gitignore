@@ -7,3 +7,4 @@ wandb
 run.sh
 *.pyc
 ckpt
+checkpoints/*
