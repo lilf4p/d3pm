@@ -500,7 +500,7 @@ if __name__ == "__main__":
                        help="Number of devices to use (int) or 'auto' for all available devices")
     parser.add_argument("--num_gpus", type=int, default=None,
                        help="Number of GPUs to use (overrides --devices)")
-    parser.add_argument("--strategy", type=str, default=None,
+    parser.add_argument("--strategy", type=str, default="auto",
                        help="Training strategy: 'ddp', 'deepspeed', etc.")
     parser.add_argument("--precision", type=str, default="32-true")
 
